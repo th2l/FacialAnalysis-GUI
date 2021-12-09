@@ -9,8 +9,6 @@ import os, sys, threading, typing
 
 import pandas as pd
 import validators
-from PyQt6.QtGui import QIcon
-from PyQt6.QtWebEngineCore import QWebEngineDownloadRequest
 from dash.exceptions import PreventUpdate
 
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
@@ -21,11 +19,14 @@ import insightface.model_zoo
 import numpy as np
 from dash import Dash, dcc, html, callback_context, dash_table
 from dash.dependencies import Input, Output, State
-from dash.long_callback import DiskcacheLongCallbackManager
 from flask import Response, stream_with_context
 import dash_bootstrap_components as dbc
+import diskcache
+from dash.long_callback import DiskcacheLongCallbackManager
 
 from PyQt6 import QtCore, QtWidgets, QtWebEngineWidgets
+from PyQt6.QtGui import QIcon
+from PyQt6.QtWebEngineCore import QWebEngineDownloadRequest
 
 # Python Requests with REST APIs, download files
 import base64
@@ -53,8 +54,6 @@ zoom_oauth_redirect_uri = os.getenv('ZOOM_REDIRECT_URI')
 zoom_userID = 'me'
 
 print(zoom_client_ID, zoom_client_secret, zoom_oauth_redirect_uri)
-## Diskcache
-import diskcache
 
 MAX_SIZE_QUEUE = None
 
@@ -90,22 +89,31 @@ class VideoCamera(QtCore.QObject):
             if self.video is not None:
                 self.video.release()
                 self.video = None
-            return None
+
+            image = np.zeros((480,640,3), dtype=np.uint8)
         else:
             if self.video is None:
                 self.video = cv2.VideoCapture(0)
 
-        success, image = self.video.read()
-        if self.capture_save != '':
-            # Save image
-            save_path = './assets/students/{}/{}.jpg'.format(self.capture_save,
-                                                             datetime.datetime.now().strftime("%m-%d-%Y_%H-%M-%S"))
-            # print(self.capture_save, save_path)
-            cv2.imwrite(save_path, image)
-            self.capture_save = ''
+            success, image = self.video.read()
+            if self.capture_save != '':
+                # Save image
+                save_path = './assets/students/{}/{}.jpg'.format(self.capture_save,
+                                                                 datetime.datetime.now().strftime("%m-%d-%Y_%H-%M-%S"))
+                # print(self.capture_save, save_path)
+                cv2.imwrite(save_path, image)
+                self.capture_save = ''
+
+        # try:
         ret, jpeg = cv2.imencode('.jpg', image)
 
         return jpeg.tobytes()
+        # except:
+        #     save_path = './assets/students/{}/{}.jpg'.format(self.capture_save,
+        #                                                      datetime.datetime.now().strftime("%m-%d-%Y_%H-%M-%S"))
+        #     print(self.capture_save, save_path, success)
+        #     cv2.imwrite(save_path, image)
+        #     return None
 
 
 def gen_camera(camera):
@@ -119,37 +127,43 @@ def gen_camera(camera):
 
 class VideoCaptureThread:
     def __init__(self, src='0', threaded=True):
+        self.threaded = threaded
+
+    def init_camera(self, src='0'):
         if src == '0':
             src = int(src)
         self.cap = cv2.VideoCapture(src)
-        print('Video src: ', src, self.cap.isOpened())
         self.width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         self.height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         self.fps = self.cap.get(cv2.CAP_PROP_FPS)
 
         self.stopped = False
         self.frame_queue = deque(maxlen=MAX_SIZE_QUEUE)
-        self.threaded = threaded
 
     def start(self):
         threading.Thread(target=self.get_frame, args=()).start()
 
     def get_frame(self):
-
-        while not self.stopped:
+        while True:
             try:
-                self.cont, frame = self.cap.read()
-                if not self.cont:
-                    self.stop()
-                    break
+                if not self.stopped:
+                    cont, frame = self.cap.read()
+                    if cont:
+                        self.frame_queue.append(frame)
+                    else:
+                        print('Stop capture')
+                        self.stop()
+                        break
                 else:
-                    self.frame_queue.append(frame)
+                    print('Stop capture')
+                    break
             except:
                 break
+        self.cap.release()
+        self.cap = None
 
     def stop(self):
         self.stopped = True
-        self.cap.release()
 
 
 class VideoWriterThread:
@@ -245,10 +259,14 @@ class FaceAnalysis(QtCore.QObject):
         self.is_running = False
 
     def gen_frame_webcam(self):
+        prev_frame = np.zeros((480,640,3), dtype=np.uint8)
         while True:
             if not self.shared_data_result_parent.poll(0.0002):
-                continue
-            frame_ret = self.shared_data_result_parent.recv()
+                frame_ret = prev_frame
+            else:
+                frame_ret = self.shared_data_result_parent.recv()
+                prev_frame = frame_ret
+
             ret, jpeg = cv2.imencode('.jpg', frame_ret)
             jpeg_send = jpeg.tobytes()
             yield (b'--frame\r\n'
@@ -266,7 +284,10 @@ class FaceAnalysis(QtCore.QObject):
                     print(len(gpus), "Physical GPUs,", len(logical_gpus), "Logical GPUs")
                 except RuntimeError as e:
                     # Memory growth must be set before GPUs have been initialized
+                    print('Using CPU')
                     print(e)
+            else:
+                print('Using CPU')
             self.init_gpu = True
 
         if self.det is None:
@@ -374,10 +395,13 @@ class FaceAnalysis(QtCore.QObject):
         if isinstance(video_src, tuple):
             write_video_src = video_src[1]
             video_src = int(video_src[0])
+            pfx_replace = '.mp4'
         else:
             write_video_src = video_src.replace('.mp4', '_result.mp4')
+            pfx_replace = '_result.mp4'
 
         cap_thread = VideoCaptureThread(video_src)
+        cap_thread.init_camera(video_src)
 
         width = cap_thread.width
         height = cap_thread.height
@@ -385,6 +409,7 @@ class FaceAnalysis(QtCore.QObject):
         cap_result_thread = VideoWriterThread(write_video_src, cv2.VideoWriter_fourcc(*'mp4v'), 25, (width, height))
 
         cur_frame_idx = 0
+
         cap_thread.start()
         # cap_result_thread.start()
 
@@ -400,13 +425,14 @@ class FaceAnalysis(QtCore.QObject):
                 frame = cap_thread.frame_queue.popleft()
 
                 if cur_frame_idx % frames_per_detect == 0:
-                    st_deep = time.time()
+                    # st_deep = time.time()
                     rec_dist, rec_class, bbs, ccs = self.image_recognize(frame)
-                    print('Time in deep: ', time.time() - st_deep)
+                    # print('Time in deep: ', time.time() - st_deep)
                 _, cur_students = cap_result_thread.draw_polyboxes(frame, rec_dist, rec_class, bbs, ccs, dist_thresh)
                 cap_result_thread.student_queue.append(cur_students)
                 if isinstance(video_src, int):
                     self.shared_data_result_child.send(frame)
+                    # print('Sent frame')
                 cap_result_thread.capW.write(frame)
 
                 cur_frame_idx += 1
@@ -415,12 +441,12 @@ class FaceAnalysis(QtCore.QObject):
                     break
 
         cap_result_thread.stop()
-        cap_thread.stop()
         cap_result_thread.capW.release()
-        cap_thread.cap.release()
 
-        os.system("ffmpeg -y -i {} -vcodec libx264 {}".format(write_video_src,
-                                                              write_video_src.replace('_result.mp4', '_analyzed.mp4')))
+        ffmpeg_cmd = "ffmpeg -y -i {} -vcodec libx264 {}".format(write_video_src,
+                                                                 write_video_src.replace(pfx_replace, '_analyzed.mp4'))
+        os.system(ffmpeg_cmd)
+
         os.system("rm {}".format(write_video_src))
 
         cv2.destroyAllWindows()
@@ -438,6 +464,7 @@ class FaceAnalysis(QtCore.QObject):
     def run(self):
 
         print('Running face analysis engine')
+
         while True:
             self.init_face_engine()
             if self.embeddings is None and self.image_classes is None:
@@ -489,14 +516,14 @@ class QDash(QtCore.QObject):
 
     def __init__(self, parent: typing.Optional['QObject'] = None) -> None:
         super(QDash, self).__init__(parent=parent)
-        # launch_uid = uuid4()
+
         cache = diskcache.Cache("./cache")
-        long_callback_manager = DiskcacheLongCallbackManager(cache, expire=3600)
+        long_callback_manager = DiskcacheLongCallbackManager(cache)
 
         self.__app = Dash(suppress_callback_exceptions=True, assets_folder='assets',
-                          long_callback_manager=long_callback_manager,
                           external_stylesheets=[dbc.themes.BOOTSTRAP],
-                          title='PRLAB - Facial Analysis', )
+                          title='PRLAB - Facial Analysis',
+                          long_callback_manager=long_callback_manager)
 
         self.oauth_code = ''
         self.access_token = ''
@@ -774,7 +801,7 @@ class QDash(QtCore.QObject):
 
         @self.app.server.route('/video_feed_analyzed')
         def video_feed_analyzed():
-            return Response(stream_with_context(self.face_engine.gen_frame_webcam()),
+            return Response(self.face_engine.gen_frame_webcam(),
                             mimetype='multipart/x-mixed-replace; boundary=frame')
 
         # Callbacks
@@ -797,12 +824,19 @@ class QDash(QtCore.QObject):
             else:
                 raise PreventUpdate
 
-        @self.app.callback(Output('student-database-modal', 'is_open'),
+        @self.app.callback([Output('student-database-modal', 'is_open'), Output('webcam-jpeg', 'src')],
                            [Input('std-db-btn', 'n_clicks'), Input('close-std-db-modal-btn', 'n_clicks')],
                            State('student-database-modal', 'is_open'), prevent_initial_call=True)
         def toggle_student_database_modal(n_click, close_n_click, is_open):
             if n_click or close_n_click:
-                return not is_open
+
+                if not is_open:
+                    src = '/video_feed'
+                else:
+                    src = '/video_feed' # ''
+
+                print('Check db modal', not is_open, src)
+                return not is_open, src
 
         @self.app.callback(Output('student-list-db', 'options'), Input("student-list-db", "search_value"),
                            running=[(Output('add-photo-btn', 'disabled'), True, False)])
@@ -1073,7 +1107,7 @@ class QDash(QtCore.QObject):
             print(viewer_value, play_url)
             return (play_url,)
 
-        @self.app.callback(Output('zoom-webcam-analyzed-modal', 'is_open'),
+        @self.app.callback([Output('zoom-webcam-analyzed-modal', 'is_open'), Output('webcam-analyzed', 'src')],
                            [Input('do-analyze-btn', 'n_clicks'), Input('do-zoom-webcam-finish', 'n_clicks')],
                            State('zoom-webcam-analyzed-modal', 'is_open'), State('zoom_webcam_store', 'data'))
         def open_webcam_analyzing(n_clicks, do_zoom_webcam_finish_click, is_open, zoom_webcam_store):
@@ -1082,11 +1116,17 @@ class QDash(QtCore.QObject):
             print('Triggered open_zoom_webcam_analyzing', 'do-analyze-btn' in change_id, self.zoom_webcam)
             if 'do-analyze-btn' in change_id and zoom_webcam_store:
                 print('Triggered, ', is_open, not is_open)
-                return not is_open
+
+                if not is_open:
+                    src = '/video_feed_analyzed'
+                else:
+                    src = '/video_feed_analyzed'  # ''
+                return not is_open, src
             elif 'do-zoom-webcam-finish' in change_id:
                 # Close zoom analyzing
                 self.zoom_stop_analyze_signal.emit()
-                return False
+                src = '/video_feed_analyzed'  # ''
+                return False, src
             else:
                 raise PreventUpdate
 
@@ -1104,7 +1144,7 @@ class QDash(QtCore.QObject):
             running=[(Output('analyze-btn', 'disabled'), True, False),
                      (Output('analyze-btn', 'children'), [dbc.Spinner(size="sm"), " Running..."], 'Analyze'),
                      ],
-            # interval=10*1800,
+            interval=1000 * 5,
             prevent_initial_call=True)
         def run_face_analysis(do_analyze_btn_clicks, attendance_data, analyze_interval, analyze_interval_type,
                               analyze_options, analyze_senstive,
@@ -1114,7 +1154,7 @@ class QDash(QtCore.QObject):
             change_id = [p['prop_id'] for p in callback_context.triggered][0]
 
             if 'do-analyze-btn' not in change_id:
-                raise PreventUpdate
+                return attendance_data, columns, ''
 
             #######
             self.zoom_webcam = zoom_webcam_store
@@ -1188,20 +1228,23 @@ class QDash(QtCore.QObject):
                 print(change_id)
             if int(viz_value) == 1 and attendance_results_data is not None:
                 # Attendance with percent for each students
-                print(attendance_results_data)
+                # print(attendance_results_data)
                 if len(attendance_results_data) > 0:
                     df = DataFrame.from_records(data=attendance_results_data)
                     stu_perc = {}
-                    for stu in df.columns:
-                        if 'Timestamp' not in stu:
-                            stu_perc[stu] = df[stu].sum() * 100 / len(df)
+                    try:
+                        for stu in df.columns:
+                            if 'Timestamp' not in stu:
+                                stu_perc[stu] = df[stu].sum() * 100 / len(df)
 
-                    print(stu_perc, stu_perc.keys(), stu_perc.values())
-                    figure = {'data': [{'x': list(stu_perc.keys()), 'y': list(stu_perc.values()), 'type': 'bar',
-                                        'name': 'Attendance (%)'}],
-                              'layout': {
-                                  'title': 'Attendance (%) visualization'
-                              }}
+                        print(stu_perc, stu_perc.keys(), stu_perc.values())
+                        figure = {'data': [{'x': list(stu_perc.keys()), 'y': list(stu_perc.values()), 'type': 'bar',
+                                            'name': 'Attendance (%)'}],
+                                  'layout': {
+                                      'title': 'Attendance (%) visualization'
+                                  }}
+                    except:
+                        raise PreventUpdate
                     # figure = px.bar(x=stu_perc.keys(), y=stu_perc.values())
                     return figure
 

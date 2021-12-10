@@ -5,6 +5,7 @@ For demo purpose only.
 To use *Cloud Recording*, we need Zoom API Client ID, Client Secret, Redirect URL for OAuth. To get that, follow instructions on [Create an OAuth App
 ](https://marketplace.zoom.us/docs/guides/build/oauth-app) page. After that, export 3 environment variables `ZOOM_CLIENT_ID`, `ZOOM_CLIENT_SECRET`, `ZOOM_REDIRECT_URI`, or modify directly [Line 51-53](https://github.com/th2l/FacialAnalysis-GUI/blob/main/main.py#L51-L53) in ```main.py```
 
+Link for video demonstration: https://1drv.ms/v/s!AoeAp4aV23Gqeq-5PvynHUotpn8?e=TegyU2 
 
 ## Credits
 
